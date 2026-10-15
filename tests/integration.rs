@@ -389,10 +389,7 @@ fn dispatch_sync_rejects_async_listeners() {
         Box::pin(async move { Ok(()) })
     });
     let mut e = Ev::default();
-    assert!(matches!(
-        d.dispatch_sync(&mut e),
-        Err(DispatchError::SyncDispatchUnavailable)
-    ));
+    assert!(matches!(d.dispatch_sync(&mut e), Err(DispatchError::SyncDispatchUnavailable)));
 }
 
 #[test]

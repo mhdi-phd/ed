@@ -82,12 +82,7 @@ impl DepthGuard {
             }
         });
         if ok {
-            Ok((
-                Self {
-                    _not_send: std::marker::PhantomData,
-                },
-                depth,
-            ))
+            Ok((Self { _not_send: std::marker::PhantomData }, depth))
         } else {
             Err(DispatchError::MaxDepthExceeded(max))
         }
@@ -105,10 +100,7 @@ type SyncFn = Box<
     dyn Fn(&mut (dyn Any + Send + Sync), &mut DispatchContext) -> ListenerResult + Send + Sync,
 >;
 type AsyncFn = Box<
-    dyn for<'a> Fn(
-            &'a mut (dyn Any + Send + Sync),
-            &'a mut DispatchContext,
-        ) -> BoxFuture<'a, ListenerResult>
+    dyn for<'a> Fn(&'a mut (dyn Any + Send + Sync), &'a mut DispatchContext) -> BoxFuture<'a, ListenerResult>
         + Send
         + Sync,
 >;
@@ -241,11 +233,7 @@ thread_local! {
 
 const FAST_CAP: usize = 64;
 
-fn fast_lookup(
-    generation: u64,
-    event_name: &str,
-    version: u64,
-) -> Option<Option<Arc<[ListenerEntry]>>> {
+fn fast_lookup(generation: u64, event_name: &str, version: u64) -> Option<Option<Arc<[ListenerEntry]>>> {
     FAST.with(|c| {
         let Ok(c) = c.try_borrow() else {
             return None;
@@ -259,12 +247,7 @@ fn fast_lookup(
     })
 }
 
-fn fast_store(
-    generation: u64,
-    event_name: &str,
-    version: u64,
-    listeners: Option<Arc<[ListenerEntry]>>,
-) {
+fn fast_store(generation: u64, event_name: &str, version: u64, listeners: Option<Arc<[ListenerEntry]>>) {
     let all_sync = listeners
         .as_ref()
         .is_some_and(|l| l.iter().all(|e| matches!(&*e.callable, ErasedCallable::Sync(_))));
@@ -285,14 +268,7 @@ fn fast_store(
         if c.len() >= FAST_CAP {
             c.clear();
         }
-        c.push((
-            (generation, event_name.into()),
-            FastEntry {
-                version,
-                listeners,
-                all_sync,
-            },
-        ));
+        c.push(((generation, event_name.into()), FastEntry { version, listeners, all_sync }));
     })
 }
 
@@ -329,24 +305,14 @@ impl<'a> DispatchContext<'a> {
         self.dispatch_named(E::default_name(), event).await
     }
 
-    pub async fn dispatch_named<E: Event>(
-        &self,
-        event_name: &str,
-        event: &mut E,
-    ) -> Result<(), DispatchError> {
+    pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
         let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
         match self.backend {
             Backend::Live(inner) => {
                 EventDispatcher::dispatch_fast(inner, self.max_depth, event_name, event, depth).await
             }
             Backend::Frozen(state) => {
-                ImmutableEventDispatcher::dispatch_frozen_inner(
-                    state,
-                    self.max_depth,
-                    event_name,
-                    event,
-                    depth,
-                )
+                ImmutableEventDispatcher::dispatch_frozen_inner(state, self.max_depth, event_name, event, depth)
                 .await
             }
         }
@@ -389,12 +355,7 @@ impl EventDispatcher {
         self.add_async_named_listener(E::default_name(), priority, listener)
     }
 
-    pub fn add_async_named_listener<E, F>(
-        &self,
-        event_name: &str,
-        priority: i32,
-        listener: F,
-    ) -> ListenerId
+    pub fn add_async_named_listener<E, F>(&self, event_name: &str, priority: i32, listener: F) -> ListenerId
     where
         E: Event,
         F: for<'a> Fn(&'a mut E, &'a mut DispatchContext) -> BoxFuture<'a, ListenerResult>
@@ -421,12 +382,7 @@ impl EventDispatcher {
     /// Every call creates a new listener with a fresh `ListenerId`; nothing is
     /// replaced. Callers that re-register must store the ID and call
     /// `remove_named_listener` first, or the bucket grows without bound.
-    pub fn add_sync_named_listener<E, F>(
-        &self,
-        event_name: &str,
-        priority: i32,
-        listener: F,
-    ) -> ListenerId
+    pub fn add_sync_named_listener<E, F>(&self, event_name: &str, priority: i32, listener: F) -> ListenerId
     where
         E: Event,
         F: Fn(&mut E, &mut DispatchContext) -> ListenerResult + Send + Sync + 'static,
@@ -483,36 +439,16 @@ impl EventDispatcher {
     #[inline]
     pub async fn dispatch<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
         let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
-        if let Some(r) = Self::try_sync_dispatch(
-            Backend::Live(&self.inner),
-            self.inner.generation,
-            self.inner.version.load(Ordering::Acquire),
-            self.max_depth,
-            E::default_name(),
-            event,
-            depth,
-        ) {
+        if let Some(r) = Self::try_sync_dispatch(Backend::Live(&self.inner), self.inner.generation, self.inner.version.load(Ordering::Acquire), self.max_depth, E::default_name(), event, depth) {
             return r;
         }
         Self::dispatch_fast(&self.inner, self.max_depth, E::default_name(), event, depth).await
     }
 
     #[inline]
-    pub async fn dispatch_named<E: Event>(
-        &self,
-        event_name: &str,
-        event: &mut E,
-    ) -> Result<(), DispatchError> {
+    pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
         let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
-        if let Some(r) = Self::try_sync_dispatch(
-            Backend::Live(&self.inner),
-            self.inner.generation,
-            self.inner.version.load(Ordering::Acquire),
-            self.max_depth,
-            event_name,
-            event,
-            depth,
-        ) {
+        if let Some(r) = Self::try_sync_dispatch(Backend::Live(&self.inner), self.inner.generation, self.inner.version.load(Ordering::Acquire), self.max_depth, event_name, event, depth) {
             return r;
         }
         Self::dispatch_fast(&self.inner, self.max_depth, event_name, event, depth).await
@@ -523,31 +459,13 @@ impl EventDispatcher {
         Self::dispatch_sync_inner(&self.inner, self.max_depth, E::default_name(), event, depth)
     }
 
-    pub fn dispatch_sync_named<E: Event>(
-        &self,
-        event_name: &str,
-        event: &mut E,
-    ) -> Result<(), DispatchError> {
+    pub fn dispatch_sync_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
         let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
         Self::dispatch_sync_inner(&self.inner, self.max_depth, event_name, event, depth)
     }
 
-    fn dispatch_sync_inner<E: Event>(
-        inner: &StateInner,
-        max_depth: usize,
-        event_name: &str,
-        event: &mut E,
-        depth: usize,
-    ) -> Result<(), DispatchError> {
-        if let Some(r) = Self::try_sync_dispatch(
-            Backend::Live(inner),
-            inner.generation,
-            inner.version.load(Ordering::Acquire),
-            max_depth,
-            event_name,
-            event,
-            depth,
-        ) {
+    fn dispatch_sync_inner<E: Event>(inner: &StateInner, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
+        if let Some(r) = Self::try_sync_dispatch(Backend::Live(inner), inner.generation, inner.version.load(Ordering::Acquire), max_depth, event_name, event, depth) {
             return r;
         }
         let generation = inner.generation;
@@ -568,13 +486,7 @@ impl EventDispatcher {
     }
 
     #[inline]
-    fn run_sync_loop<E: Event>(
-        backend: Backend<'_>,
-        max_depth: usize,
-        event: &mut E,
-        listeners: &[ListenerEntry],
-        depth: usize,
-    ) -> Result<(), DispatchError> {
+    fn run_sync_loop<E: Event>(backend: Backend<'_>, max_depth: usize, event: &mut E, listeners: &[ListenerEntry], depth: usize) -> Result<(), DispatchError> {
         let mut ctx = DispatchContext {
             backend,
             stopped: false,
@@ -602,15 +514,7 @@ impl EventDispatcher {
     }
 
     #[inline]
-    fn try_sync_dispatch<E: Event>(
-        backend: Backend<'_>,
-        generation: u64,
-        version: u64,
-        max_depth: usize,
-        event_name: &str,
-        event: &mut E,
-        depth: usize,
-    ) -> Option<Result<(), DispatchError>> {
+    fn try_sync_dispatch<E: Event>(backend: Backend<'_>, generation: u64, version: u64, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Option<Result<(), DispatchError>> {
         let result: Result<Option<Result<(), DispatchError>>, _> = FAST.try_with(|c| {
             let cache = c.try_borrow().ok()?;
             for ((g, n), e) in cache.iter() {
@@ -619,9 +523,7 @@ impl EventDispatcher {
                         return None;
                     }
                     let listeners: &[ListenerEntry] = e.listeners.as_deref()?;
-                    return Some(Self::run_sync_loop(
-                        backend, max_depth, event, listeners, depth,
-                    ));
+                    return Some(Self::run_sync_loop(backend, max_depth, event, listeners, depth));
                 }
             }
             None
@@ -630,13 +532,7 @@ impl EventDispatcher {
     }
 
     #[inline]
-    async fn dispatch_fast<E: Event>(
-        inner: &StateInner,
-        max_depth: usize,
-        event_name: &str,
-        event: &mut E,
-        depth: usize,
-    ) -> Result<(), DispatchError> {
+    async fn dispatch_fast<E: Event>(inner: &StateInner, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
         let generation = inner.generation;
         let version = inner.version.load(Ordering::Acquire);
         let listeners = match fast_lookup(generation, event_name, version) {
@@ -728,15 +624,7 @@ impl ImmutableEventDispatcher {
     #[inline]
     pub async fn dispatch<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
         let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
-        if let Some(r) = EventDispatcher::try_sync_dispatch(
-            Backend::Frozen(&self.state),
-            self.state.generation,
-            0,
-            self.max_depth,
-            E::default_name(),
-            event,
-            depth,
-        ) {
+        if let Some(r) = EventDispatcher::try_sync_dispatch(Backend::Frozen(&self.state), self.state.generation, 0, self.max_depth, E::default_name(), event, depth) {
             return r;
         }
         Self::dispatch_frozen_inner(&self.state, self.max_depth, E::default_name(), event, depth)
@@ -744,34 +632,16 @@ impl ImmutableEventDispatcher {
     }
 
     #[inline]
-    pub async fn dispatch_named<E: Event>(
-        &self,
-        event_name: &str,
-        event: &mut E,
-    ) -> Result<(), DispatchError> {
+    pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
         let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
-        if let Some(r) = EventDispatcher::try_sync_dispatch(
-            Backend::Frozen(&self.state),
-            self.state.generation,
-            0,
-            self.max_depth,
-            event_name,
-            event,
-            depth,
-        ) {
+        if let Some(r) = EventDispatcher::try_sync_dispatch(Backend::Frozen(&self.state), self.state.generation, 0, self.max_depth, event_name, event, depth) {
             return r;
         }
         Self::dispatch_frozen_inner(&self.state, self.max_depth, event_name, event, depth).await
     }
 
     #[inline]
-    async fn dispatch_frozen_inner<E: Event>(
-        state: &FrozenState,
-        max_depth: usize,
-        event_name: &str,
-        event: &mut E,
-        depth: usize,
-    ) -> Result<(), DispatchError> {
+    async fn dispatch_frozen_inner<E: Event>(state: &FrozenState, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
         let generation = state.generation;
         let listeners = match fast_lookup(generation, event_name, 0) {
             Some(listeners) => listeners,
