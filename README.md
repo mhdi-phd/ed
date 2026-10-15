@@ -44,8 +44,8 @@ Symfony-PHP `dispatch` ≈ 195ns (1 listener).
 - Listeners added/removed during a dispatch take effect on the next dispatch
   (snapshot semantics). Concurrent mutation is safe but not linearizable with
   an in-flight dispatch.
-- Dispatch futures are `Send`. `try_sync_dispatch` never holds a lock across
-  `.await`.
+- Dispatch futures are `!Send` (thread-local depth guard). Drive each future
+  to completion on one thread, or use `dispatch_sync` for sync listeners.
 
 ## Example
 
