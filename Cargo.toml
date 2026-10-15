@@ -1,0 +1,12 @@
+[package]
+name = "ed"
+version = "0.1.0"
+edition = "2021"
+description = "Async event dispatcher in the spirit of Symfony EventDispatcher: named listeners, priorities, propagation stop, depth-guarded nested dispatch"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
