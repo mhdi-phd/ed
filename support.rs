@@ -20,3 +20,9 @@ pub fn block_on<F: Future>(mut f: F) -> F::Output {
         }
     }
 }
+
+pub fn poll_once<F: Future + ?Sized>(fut: Pin<&mut F>) -> Poll<F::Output> {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    fut.poll(&mut cx)
+}

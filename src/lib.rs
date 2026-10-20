@@ -1,6 +1,7 @@
 use std::any::{Any, TypeId};
 use std::future::Future;
 use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::cmp::Reverse;
@@ -60,39 +61,74 @@ pub trait Event: Any + Send + Sync + 'static {
 }
 
 thread_local! {
-    static DEPTH: Cell<usize> = const { Cell::new(0) };
+    static AMBIENT: Cell<usize> = const { Cell::new(0) };
 }
 
-struct DepthGuard {
-    _not_send: std::marker::PhantomData<*const ()>,
+#[inline]
+fn ambient_depth() -> usize {
+    AMBIENT.with(|c| c.get())
 }
 
-impl DepthGuard {
-    #[inline]
-    fn enter(max: usize) -> Result<(Self, usize), DispatchError> {
-        let mut depth = 0;
-        let mut ok = false;
-        DEPTH.with(|d| {
-            let cur = d.get();
-            let allowed = if max == 0 { cur == 0 } else { cur < max };
-            if allowed {
-                d.set(cur + 1);
-                depth = cur + 1;
-                ok = true;
-            }
-        });
-        if ok {
-            Ok((Self { _not_send: std::marker::PhantomData }, depth))
-        } else {
-            Err(DispatchError::MaxDepthExceeded(max))
-        }
+#[inline]
+fn set_ambient(depth: usize) -> usize {
+    AMBIENT.with(|c| { let prev = c.get(); c.set(depth); prev })
+}
+
+#[inline]
+fn depth_limit(max: usize) -> usize {
+    if max == 0 { 1 } else { max }
+}
+
+#[inline]
+fn entry_depth(max: usize) -> Result<usize, DispatchError> {
+    let depth = ambient_depth() + 1;
+    if depth > depth_limit(max) {
+        Err(DispatchError::MaxDepthExceeded(max))
+    } else {
+        Ok(depth)
     }
 }
 
-impl Drop for DepthGuard {
+struct AmbientGuard {
+    prev: usize,
+}
+
+impl AmbientGuard {
+    #[inline]
+    fn set(depth: usize) -> Self {
+        AmbientGuard { prev: set_ambient(depth) }
+    }
+}
+
+impl Drop for AmbientGuard {
     #[inline]
     fn drop(&mut self) {
-        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        let prev = self.prev;
+        let _ = AMBIENT.try_with(|c| c.set(prev));
+    }
+}
+
+struct WithAmbient<F> {
+    inner: Pin<Box<F>>,
+    depth: usize,
+}
+
+impl<F> WithAmbient<F> {
+    #[inline]
+    fn new(inner: F, depth: usize) -> Self {
+        WithAmbient { inner: Box::pin(inner), depth }
+    }
+}
+
+impl<F: Future> Future for WithAmbient<F> {
+    type Output = F::Output;
+
+    #[inline]
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<F::Output> {
+        let prev = set_ambient(self.depth);
+        let out = self.inner.as_mut().poll(cx);
+        let _ = AMBIENT.try_with(|c| c.set(prev));
+        out
     }
 }
 
@@ -306,7 +342,10 @@ impl<'a> DispatchContext<'a> {
     }
 
     pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
-        let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
+        let depth = self.depth + 1;
+        if depth > depth_limit(self.max_depth) {
+            return Err(DispatchError::MaxDepthExceeded(self.max_depth));
+        }
         match self.backend {
             Backend::Live(inner) => {
                 EventDispatcher::dispatch_fast(inner, self.max_depth, event_name, event, depth).await
@@ -438,7 +477,7 @@ impl EventDispatcher {
 
     #[inline]
     pub async fn dispatch<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
-        let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
+        let depth = entry_depth(self.max_depth)?;
         if let Some(r) = Self::try_sync_dispatch(Backend::Live(&self.inner), self.inner.generation, self.inner.version.load(Ordering::Acquire), self.max_depth, E::default_name(), event, depth) {
             return r;
         }
@@ -447,7 +486,7 @@ impl EventDispatcher {
 
     #[inline]
     pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
-        let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
+        let depth = entry_depth(self.max_depth)?;
         if let Some(r) = Self::try_sync_dispatch(Backend::Live(&self.inner), self.inner.generation, self.inner.version.load(Ordering::Acquire), self.max_depth, event_name, event, depth) {
             return r;
         }
@@ -455,12 +494,12 @@ impl EventDispatcher {
     }
 
     pub fn dispatch_sync<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
-        let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
+        let depth = entry_depth(self.max_depth)?;
         Self::dispatch_sync_inner(&self.inner, self.max_depth, E::default_name(), event, depth)
     }
 
     pub fn dispatch_sync_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
-        let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
+        let depth = entry_depth(self.max_depth)?;
         Self::dispatch_sync_inner(&self.inner, self.max_depth, event_name, event, depth)
     }
 
@@ -487,6 +526,7 @@ impl EventDispatcher {
 
     #[inline]
     fn run_sync_loop<E: Event>(backend: Backend<'_>, max_depth: usize, event: &mut E, listeners: &[ListenerEntry], depth: usize) -> Result<(), DispatchError> {
+        let _ambient = AmbientGuard::set(depth);
         let mut ctx = DispatchContext {
             backend,
             stopped: false,
@@ -532,7 +572,11 @@ impl EventDispatcher {
     }
 
     #[inline]
-    async fn dispatch_fast<E: Event>(inner: &StateInner, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
+    fn dispatch_fast<'a, E: Event>(inner: &'a StateInner, max_depth: usize, event_name: &'a str, event: &'a mut E, depth: usize) -> WithAmbient<impl Future<Output = Result<(), DispatchError>> + 'a> {
+        WithAmbient::new(Self::dispatch_fast_inner(inner, max_depth, event_name, event, depth), depth)
+    }
+
+    async fn dispatch_fast_inner<E: Event>(inner: &StateInner, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
         let generation = inner.generation;
         let version = inner.version.load(Ordering::Acquire);
         let listeners = match fast_lookup(generation, event_name, version) {
@@ -623,7 +667,7 @@ pub struct ImmutableEventDispatcher {
 impl ImmutableEventDispatcher {
     #[inline]
     pub async fn dispatch<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
-        let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
+        let depth = entry_depth(self.max_depth)?;
         if let Some(r) = EventDispatcher::try_sync_dispatch(Backend::Frozen(&self.state), self.state.generation, 0, self.max_depth, E::default_name(), event, depth) {
             return r;
         }
@@ -633,7 +677,7 @@ impl ImmutableEventDispatcher {
 
     #[inline]
     pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
-        let (_guard, depth) = DepthGuard::enter(self.max_depth)?;
+        let depth = entry_depth(self.max_depth)?;
         if let Some(r) = EventDispatcher::try_sync_dispatch(Backend::Frozen(&self.state), self.state.generation, 0, self.max_depth, event_name, event, depth) {
             return r;
         }
@@ -641,7 +685,11 @@ impl ImmutableEventDispatcher {
     }
 
     #[inline]
-    async fn dispatch_frozen_inner<E: Event>(state: &FrozenState, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
+    fn dispatch_frozen_inner<'a, E: Event>(state: &'a FrozenState, max_depth: usize, event_name: &'a str, event: &'a mut E, depth: usize) -> WithAmbient<impl Future<Output = Result<(), DispatchError>> + 'a> {
+        WithAmbient::new(Self::dispatch_frozen_impl(state, max_depth, event_name, event, depth), depth)
+    }
+
+    async fn dispatch_frozen_impl<E: Event>(state: &FrozenState, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
         let generation = state.generation;
         let listeners = match fast_lookup(generation, event_name, 0) {
             Some(listeners) => listeners,
