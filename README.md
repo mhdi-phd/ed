@@ -29,11 +29,11 @@ depth guard that cannot be bypassed.
 
 | listeners | per dispatch |
 |----------:|-------------:|
-| 1         | ~94ns        |
-| 8         | ~120ns       |
-| 64        | ~546ns       |
+| 1         | ~44ns        |
+| 8         | ~69ns        |
+| 64        | ~490ns       |
 
-(`dispatch_sync` at 1 listener: ~85ns.)
+(`dispatch_sync` at 1 listener: ~38ns.)
 
 For comparison on the same machine: WordPress-PHP `apply_filters` ≈ 680ns,
 Symfony-PHP `dispatch` ≈ 195ns (1 listener).

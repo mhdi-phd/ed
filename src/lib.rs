@@ -9,7 +9,7 @@ use std::any::{Any, TypeId};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::cmp::Reverse;
 use std::fmt;
@@ -36,9 +36,7 @@ impl fmt::Display for DispatchError {
         match self {
             Self::MaxDepthExceeded(max) => write!(f, "max nested dispatch depth exceeded ({max})"),
             Self::ListenerError(err) => write!(f, "listener error: {err}"),
-            Self::SyncDispatchUnavailable => {
-                write!(f, "sync dispatch unavailable (async listeners present)")
-            }
+            Self::SyncDispatchUnavailable => write!(f, "sync dispatch unavailable (async listeners present)"),
         }
     }
 }
@@ -81,15 +79,12 @@ fn set_ambient(depth: usize) -> usize {
     AMBIENT.with(|c| { let prev = c.get(); c.set(depth); prev })
 }
 
+/// Checks `depth` against the configured maximum (total depth including the
+/// root dispatch). A `max` of 0 is clamped to 1: root only, never unlimited.
 #[inline]
-fn depth_limit(max: usize) -> usize {
-    if max == 0 { 1 } else { max }
-}
-
-#[inline]
-fn entry_depth(max: usize) -> Result<usize, DispatchError> {
-    let depth = ambient_depth() + 1;
-    if depth > depth_limit(max) {
+fn check_depth(depth: usize, max: usize) -> Result<usize, DispatchError> {
+    let limit = if max == 0 { 1 } else { max };
+    if depth > limit {
         Err(DispatchError::MaxDepthExceeded(max))
     } else {
         Ok(depth)
@@ -236,10 +231,24 @@ impl EventBucket {
 type Buckets = HashMap<Box<str>, HashMap<TypeId, EventBucket>>;
 
 struct StateInner {
+    id: u64,
+    version: AtomicU64,
     buckets: RwLock<Buckets>,
 }
 
+impl StateInner {
+    fn new() -> Self {
+        Self { id: next_id(), version: AtomicU64::new(0), buckets: RwLock::new(HashMap::new()) }
+    }
+
+    #[inline]
+    fn bump(&self) {
+        self.version.fetch_add(1, Ordering::Release);
+    }
+}
+
 struct FrozenState {
+    id: u64,
     buckets: HashMap<Box<str>, HashMap<TypeId, Arc<[ListenerEntry]>>>,
 }
 
@@ -249,49 +258,71 @@ enum Backend<'a> {
     Frozen(&'a FrozenState),
 }
 
-fn fetch(backend: Backend<'_>, event_name: &str, type_id: TypeId) -> Option<Arc<[ListenerEntry]>> {
-    match backend {
-        Backend::Live(inner) => {
-            enum Look {
-                Hit(Arc<[ListenerEntry]>),
-                Dirty,
-                Miss,
-            }
-            let look = {
-                let buckets = inner.buckets.read().unwrap_or_else(|e| e.into_inner());
-                match buckets.get(event_name).and_then(|m| m.get(&type_id)) {
-                    None => Look::Miss,
-                    Some(b) => match &b.sorted {
-                        Some(s) => Look::Hit(Arc::clone(s)),
-                        None if b.raw.is_empty() => Look::Miss,
-                        None => Look::Dirty,
-                    },
-                }
-            };
-            match look {
-                Look::Hit(s) => Some(s),
-                Look::Miss => None,
-                Look::Dirty => {
-                    let mut buckets = inner.buckets.write().unwrap_or_else(|e| e.into_inner());
-                    buckets.get_mut(event_name).and_then(|m| m.get_mut(&type_id)).and_then(|b| {
-                        if b.raw.is_empty() { None } else { Some(b.get_sorted()) }
-                    })
-                }
-            }
+type CacheEntry = (u64, Box<str>, TypeId, u64, Option<Arc<[ListenerEntry]>>);
+
+thread_local! {
+    static CACHE: RefCell<Vec<CacheEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+fn cache_get(id: u64, event_name: &str, type_id: TypeId, version: u64) -> Option<Option<Arc<[ListenerEntry]>>> {
+    CACHE.with(|c| {
+        let c = c.try_borrow().ok()?;
+        c.iter()
+            .find(|e| e.0 == id && e.3 == version && e.2 == type_id && &*e.1 == event_name)
+            .map(|e| e.4.clone())
+    })
+}
+
+fn cache_put(id: u64, event_name: &str, type_id: TypeId, version: u64, snap: Option<Arc<[ListenerEntry]>>) {
+    CACHE.with(|c| {
+        let Ok(mut c) = c.try_borrow_mut() else {
+            return;
+        };
+        if let Some(e) = c.iter_mut().find(|e| e.0 == id && e.2 == type_id && &*e.1 == event_name) {
+            e.3 = version;
+            e.4 = snap;
+            return;
         }
-        Backend::Frozen(state) => state
-            .buckets
-            .get(event_name)
-            .and_then(|m| m.get(&type_id))
-            .cloned(),
+        if c.len() >= 64 {
+            c.remove(0);
+        }
+        c.push((id, event_name.into(), type_id, version, snap));
+    })
+}
+
+fn fetch(backend: Backend<'_>, event_name: &str, type_id: TypeId) -> Option<Arc<[ListenerEntry]>> {
+    let (id, version) = match backend {
+        Backend::Live(inner) => (inner.id, inner.version.load(Ordering::Acquire)),
+        Backend::Frozen(state) => (state.id, 0),
+    };
+    if let Some(hit) = cache_get(id, event_name, type_id, version) {
+        return hit;
+    }
+    let snap = match backend {
+        Backend::Live(inner) => fetch_slow(inner, event_name, type_id),
+        Backend::Frozen(state) => state.buckets.get(event_name).and_then(|m| m.get(&type_id)).cloned(),
+    };
+    cache_put(id, event_name, type_id, version, snap.clone());
+    snap
+}
+
+fn fetch_slow(inner: &StateInner, event_name: &str, type_id: TypeId) -> Option<Arc<[ListenerEntry]>> {
+    let cached = {
+        let buckets = inner.buckets.read().unwrap_or_else(|e| e.into_inner());
+        buckets.get(event_name).and_then(|m| m.get(&type_id)).and_then(|b| b.sorted.clone())
+    };
+    match cached {
+        Some(c) => Some(c),
+        None => {
+            let mut buckets = inner.buckets.write().unwrap_or_else(|e| e.into_inner());
+            buckets.get_mut(event_name).and_then(|m| m.get_mut(&type_id)).map(|b| b.get_sorted())
+        }
     }
 }
 
 #[inline]
 fn all_sync(listeners: &[ListenerEntry]) -> bool {
-    listeners
-        .iter()
-        .all(|e| matches!(&*e.callable, ErasedCallable::Sync(_)))
+    listeners.iter().all(|e| matches!(&*e.callable, ErasedCallable::Sync(_)))
 }
 
 fn run_sync_loop<E: Event>(backend: Backend<'_>, max_depth: usize, event: &mut E, listeners: &[ListenerEntry], depth: usize) -> Result<(), DispatchError> {
@@ -324,35 +355,23 @@ async fn run_async_loop<E: Event>(backend: Backend<'_>, max_depth: usize, listen
 }
 
 fn try_fast_sync<E: Event>(backend: Backend<'_>, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Option<Result<(), DispatchError>> {
-    let listeners = fetch(backend, event_name, TypeId::of::<E>())?;
-    if !all_sync(&listeners) {
-        return None;
+    match fetch(backend, event_name, TypeId::of::<E>()) {
+        None => Some(Ok(())),
+        Some(l) if all_sync(&l) => Some(run_sync_loop(backend, max_depth, event, &l, depth)),
+        Some(_) => None,
     }
-    Some(run_sync_loop(backend, max_depth, event, &listeners, depth))
 }
 
 fn dispatch_sync_from<E: Event>(backend: Backend<'_>, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
-    let listeners = match fetch(backend, event_name, TypeId::of::<E>()) {
-        Some(l) => l,
-        None => return Ok(()),
-    };
-    if !all_sync(&listeners) {
-        return Err(DispatchError::SyncDispatchUnavailable);
+    match fetch(backend, event_name, TypeId::of::<E>()) {
+        None => Ok(()),
+        Some(l) if all_sync(&l) => run_sync_loop(backend, max_depth, event, &l, depth),
+        Some(_) => Err(DispatchError::SyncDispatchUnavailable),
     }
-    run_sync_loop(backend, max_depth, event, &listeners, depth)
 }
 
-fn dispatch_async_from<'a, E: Event>(backend: Backend<'a>, max_depth: usize, event_name: &'a str, event: &'a mut E, depth: usize) -> WithAmbient<impl Future<Output = Result<(), DispatchError>> + 'a> {
-    WithAmbient::new(async move {
-        let listeners = match fetch(backend, event_name, TypeId::of::<E>()) {
-            Some(l) => l,
-            None => return Ok(()),
-        };
-        if all_sync(&listeners) {
-            return run_sync_loop(backend, max_depth, event, &listeners, depth);
-        }
-        run_async_loop(backend, max_depth, &listeners, event, depth).await
-    }, depth)
+fn dispatch_async_from<'a, E: Event>(backend: Backend<'a>, max_depth: usize, listeners: &'a [ListenerEntry], event: &'a mut E, depth: usize) -> WithAmbient<impl Future<Output = Result<(), DispatchError>> + 'a> {
+    WithAmbient::new(run_async_loop(backend, max_depth, listeners, event, depth), depth)
 }
 
 pub struct DispatchContext<'a> {
@@ -383,14 +402,14 @@ impl<'a> DispatchContext<'a> {
     }
 
     pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
-        let depth = self.depth + 1;
-        if depth > depth_limit(self.max_depth) {
-            return Err(DispatchError::MaxDepthExceeded(self.max_depth));
-        }
+        let depth = check_depth(self.depth + 1, self.max_depth)?;
         if let Some(r) = try_fast_sync(self.backend, self.max_depth, event_name, event, depth) {
             return r;
         }
-        dispatch_async_from(self.backend, self.max_depth, event_name, event, depth).await
+        match fetch(self.backend, event_name, TypeId::of::<E>()) {
+            None => Ok(()),
+            Some(l) => dispatch_async_from(self.backend, self.max_depth, &l, event, depth).await,
+        }
     }
 
     pub fn dispatch_sync<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
@@ -398,10 +417,7 @@ impl<'a> DispatchContext<'a> {
     }
 
     pub fn dispatch_sync_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
-        let depth = self.depth + 1;
-        if depth > depth_limit(self.max_depth) {
-            return Err(DispatchError::MaxDepthExceeded(self.max_depth));
-        }
+        let depth = check_depth(self.depth + 1, self.max_depth)?;
         dispatch_sync_from(self.backend, self.max_depth, event_name, event, depth)
     }
 }
@@ -420,10 +436,7 @@ impl Default for EventDispatcher {
 
 impl EventDispatcher {
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(StateInner { buckets: RwLock::new(HashMap::new()) }),
-            max_depth: DEFAULT_MAX_DEPTH,
-        }
+        Self { inner: Arc::new(StateInner::new()), max_depth: DEFAULT_MAX_DEPTH }
     }
 
     /// Sets the maximum TOTAL dispatch depth, including the root dispatch:
@@ -438,22 +451,15 @@ impl EventDispatcher {
     fn add_entry<E: Event>(&self, event_name: &str, entry: ListenerEntry) -> ListenerId {
         let id = entry.id;
         let mut buckets = self.inner.buckets.write().unwrap_or_else(|e| e.into_inner());
-        buckets
-            .entry(event_name.into())
-            .or_default()
-            .entry(TypeId::of::<E>())
-            .or_default()
-            .add(entry);
+        buckets.entry(event_name.into()).or_default().entry(TypeId::of::<E>()).or_default().add(entry);
+        self.inner.bump();
         id
     }
 
     pub fn add_async_listener<E, F>(&self, priority: i32, listener: F) -> ListenerId
     where
         E: Event,
-        F: for<'a> Fn(&'a mut E, &'a mut DispatchContext) -> BoxFuture<'a, ListenerResult>
-            + Send
-            + Sync
-            + 'static,
+        F: for<'a> Fn(&'a mut E, &'a mut DispatchContext) -> BoxFuture<'a, ListenerResult> + Send + Sync + 'static,
     {
         self.add_async_named_listener(E::default_name(), priority, listener)
     }
@@ -461,10 +467,7 @@ impl EventDispatcher {
     pub fn add_async_named_listener<E, F>(&self, event_name: &str, priority: i32, listener: F) -> ListenerId
     where
         E: Event,
-        F: for<'a> Fn(&'a mut E, &'a mut DispatchContext) -> BoxFuture<'a, ListenerResult>
-            + Send
-            + Sync
-            + 'static,
+        F: for<'a> Fn(&'a mut E, &'a mut DispatchContext) -> BoxFuture<'a, ListenerResult> + Send + Sync + 'static,
     {
         let entry = ListenerEntry::new_async::<E, F>(priority, listener);
         self.add_entry::<E>(event_name, entry)
@@ -513,57 +516,34 @@ impl EventDispatcher {
         if by_type.is_empty() {
             buckets.remove(&*name);
         }
+        self.inner.bump();
         true
-    }
-
-    pub fn has_listeners<E: Event>(&self) -> bool {
-        let buckets = self.inner.buckets.read().unwrap_or_else(|e| e.into_inner());
-        buckets
-            .get(E::default_name())
-            .and_then(|m| m.get(&TypeId::of::<E>()))
-            .is_some_and(|b| !b.raw.is_empty())
-    }
-
-    pub fn has_named_listeners(&self, event_name: &str) -> bool {
-        let buckets = self.inner.buckets.read().unwrap_or_else(|e| e.into_inner());
-        buckets
-            .get(event_name)
-            .is_some_and(|m| m.values().any(|b| !b.raw.is_empty()))
-    }
-
-    pub fn listener_count<E: Event>(&self) -> usize {
-        let buckets = self.inner.buckets.read().unwrap_or_else(|e| e.into_inner());
-        buckets
-            .get(E::default_name())
-            .and_then(|m| m.get(&TypeId::of::<E>()))
-            .map_or(0, |b| b.raw.len())
     }
 
     #[inline]
     pub async fn dispatch<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
-        let depth = entry_depth(self.max_depth)?;
-        if let Some(r) = try_fast_sync(Backend::Live(&self.inner), self.max_depth, E::default_name(), event, depth) {
-            return r;
-        }
-        dispatch_async_from(Backend::Live(&self.inner), self.max_depth, E::default_name(), event, depth).await
+        self.dispatch_named(E::default_name(), event).await
     }
 
     #[inline]
     pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
-        let depth = entry_depth(self.max_depth)?;
-        if let Some(r) = try_fast_sync(Backend::Live(&self.inner), self.max_depth, event_name, event, depth) {
+        let depth = check_depth(ambient_depth() + 1, self.max_depth)?;
+        let backend = Backend::Live(&self.inner);
+        if let Some(r) = try_fast_sync(backend, self.max_depth, event_name, event, depth) {
             return r;
         }
-        dispatch_async_from(Backend::Live(&self.inner), self.max_depth, event_name, event, depth).await
+        match fetch(backend, event_name, TypeId::of::<E>()) {
+            None => Ok(()),
+            Some(l) => dispatch_async_from(backend, self.max_depth, &l, event, depth).await,
+        }
     }
 
     pub fn dispatch_sync<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
-        let depth = entry_depth(self.max_depth)?;
-        dispatch_sync_from(Backend::Live(&self.inner), self.max_depth, E::default_name(), event, depth)
+        self.dispatch_sync_named(E::default_name(), event)
     }
 
     pub fn dispatch_sync_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
-        let depth = entry_depth(self.max_depth)?;
+        let depth = check_depth(ambient_depth() + 1, self.max_depth)?;
         dispatch_sync_from(Backend::Live(&self.inner), self.max_depth, event_name, event, depth)
     }
 
@@ -581,10 +561,7 @@ impl EventDispatcher {
                 frozen.insert(name.clone(), types);
             }
         }
-        ImmutableEventDispatcher {
-            state: Arc::new(FrozenState { buckets: frozen }),
-            max_depth: self.max_depth,
-        }
+        ImmutableEventDispatcher { state: Arc::new(FrozenState { id: next_id(), buckets: frozen }), max_depth: self.max_depth }
     }
 }
 
@@ -597,20 +574,20 @@ pub struct ImmutableEventDispatcher {
 impl ImmutableEventDispatcher {
     #[inline]
     pub async fn dispatch<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
-        let depth = entry_depth(self.max_depth)?;
-        if let Some(r) = try_fast_sync(Backend::Frozen(&self.state), self.max_depth, E::default_name(), event, depth) {
-            return r;
-        }
-        dispatch_async_from(Backend::Frozen(&self.state), self.max_depth, E::default_name(), event, depth).await
+        self.dispatch_named(E::default_name(), event).await
     }
 
     #[inline]
     pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
-        let depth = entry_depth(self.max_depth)?;
-        if let Some(r) = try_fast_sync(Backend::Frozen(&self.state), self.max_depth, event_name, event, depth) {
+        let depth = check_depth(ambient_depth() + 1, self.max_depth)?;
+        let backend = Backend::Frozen(&self.state);
+        if let Some(r) = try_fast_sync(backend, self.max_depth, event_name, event, depth) {
             return r;
         }
-        dispatch_async_from(Backend::Frozen(&self.state), self.max_depth, event_name, event, depth).await
+        match fetch(backend, event_name, TypeId::of::<E>()) {
+            None => Ok(()),
+            Some(l) => dispatch_async_from(backend, self.max_depth, &l, event, depth).await,
+        }
     }
 
     pub fn dispatch_sync<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
@@ -618,7 +595,7 @@ impl ImmutableEventDispatcher {
     }
 
     pub fn dispatch_sync_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
-        let depth = entry_depth(self.max_depth)?;
+        let depth = check_depth(ambient_depth() + 1, self.max_depth)?;
         dispatch_sync_from(Backend::Frozen(&self.state), self.max_depth, event_name, event, depth)
     }
 }

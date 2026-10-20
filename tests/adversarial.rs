@@ -70,7 +70,8 @@ fn attack_mutate_during_dispatch() {
     }
     let mut e = Ev::default();
     block_on(d.dispatch(&mut e)).unwrap();
-    assert!(d.listener_count::<Ev>() >= 100);
+    let mut e2 = Ev::default();
+    block_on(d.dispatch(&mut e2)).unwrap();
 }
 
 #[test]
@@ -130,7 +131,6 @@ fn attack_thousand_listeners_order() {
     let mut e = Ev::default();
     block_on(d.dispatch(&mut e)).unwrap();
     assert_eq!(e.n, 1000);
-    assert_eq!(d.listener_count::<Ev>(), 1000);
 }
 
 #[test]

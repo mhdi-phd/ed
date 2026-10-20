@@ -62,7 +62,6 @@ fn listener_ids_are_unique() {
     let mut e = Ev::default();
     block_on(d.dispatch(&mut e)).unwrap();
     assert_eq!(e.log.len(), 2);
-    assert_eq!(d.listener_count::<Ev>(), 2);
 }
 
 #[test]
@@ -166,18 +165,28 @@ fn ctx_depth_reported() {
 }
 
 #[test]
-fn add_remove_has() {
+fn add_remove() {
     let d = new_disp();
-    assert!(!d.has_listeners::<Ev>());
-    let a = d.add_sync_listener::<Ev, _>(0, |_, _| Ok(()));
-    let b = d.add_sync_listener::<Ev, _>(0, |_, _| Ok(()));
-    assert!(d.has_listeners::<Ev>());
-    assert_eq!(d.listener_count::<Ev>(), 2);
+    let a = d.add_sync_listener::<Ev, _>(0, |e, _| {
+        e.log.push("x");
+        Ok(())
+    });
+    let b = d.add_sync_listener::<Ev, _>(0, |e, _| {
+        e.log.push("x");
+        Ok(())
+    });
+    let mut e = Ev::default();
+    block_on(d.dispatch(&mut e)).unwrap();
+    assert_eq!(e.log.len(), 2);
     assert!(d.remove_listener(a));
     assert!(!d.remove_listener(a));
-    assert_eq!(d.listener_count::<Ev>(), 1);
+    let mut e = Ev::default();
+    block_on(d.dispatch(&mut e)).unwrap();
+    assert_eq!(e.log.len(), 1);
     assert!(d.remove_listener(b));
-    assert!(!d.has_listeners::<Ev>());
+    let mut e = Ev::default();
+    block_on(d.dispatch(&mut e)).unwrap();
+    assert!(e.log.is_empty());
 }
 
 #[test]
@@ -404,7 +413,9 @@ fn remove_listener_needs_only_id() {
     });
     assert!(d.remove_listener(a));
     assert!(!d.remove_listener(a));
-    assert_eq!(d.listener_count::<Ev>(), 0);
+    let mut e0 = Ev::default();
+    block_on(d.dispatch(&mut e0)).unwrap();
+    assert!(e0.log.is_empty());
     let mut e = Ev::default();
     block_on(d.dispatch_named::<Ev>("named", &mut e)).unwrap();
     assert_eq!(e.log, vec!["b"]);
@@ -417,12 +428,18 @@ fn remove_listener_needs_only_id() {
 #[test]
 fn concurrent_add_and_dispatch() {
     let d = Arc::new(new_disp());
+    let hits = Arc::new(AtomicUsize::new(0));
     let mut handles = vec![];
     for t in 0..8 {
         let d2 = d.clone();
+        let hits2 = hits.clone();
         handles.push(std::thread::spawn(move || {
             for i in 0..50 {
-                d2.add_sync_listener::<Ev, _>(0, |_, _| Ok(()));
+                let hits3 = hits2.clone();
+                d2.add_sync_listener::<Ev, _>(0, move |_, _| {
+                    hits3.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
                 let mut e = Ev::default();
                 block_on(d2.dispatch(&mut e)).unwrap();
             }
@@ -431,7 +448,10 @@ fn concurrent_add_and_dispatch() {
     for h in handles {
         h.join().unwrap();
     }
-    assert_eq!(d.listener_count::<Ev>(), 400);
+    hits.store(0, Ordering::SeqCst);
+    let mut e = Ev::default();
+    block_on(d.dispatch(&mut e)).unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 400);
 }
 
 #[test]
