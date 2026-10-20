@@ -1,3 +1,10 @@
+//! An event dispatcher in the spirit of Symfony's, rebuilt for Rust.
+//!
+//! Listeners are keyed by (event name, event type): dispatching a name with
+//! a different event type than the one registered finds no listeners, by
+//! design. Sync and async listeners mix freely; dispatch depth is the total
+//! nesting depth including the root dispatch.
+
 use std::any::{Any, TypeId};
 use std::future::Future;
 use std::pin::Pin;
@@ -419,8 +426,10 @@ impl EventDispatcher {
         }
     }
 
-    /// Sets the maximum nested dispatch depth. `0` means the root dispatch
-    /// still runs but any nested dispatch is rejected (it is NOT unlimited).
+    /// Sets the maximum TOTAL dispatch depth, including the root dispatch:
+    /// `with_max_depth(2)` runs the root dispatch plus one nested level.
+    /// `0` is clamped to `1` (root only, nested dispatch rejected), so `0`
+    /// and `1` behave the same; `0` never means unlimited.
     pub fn with_max_depth(mut self, max_depth: usize) -> Self {
         self.max_depth = max_depth;
         self
