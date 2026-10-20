@@ -50,6 +50,31 @@ impl Future for YieldOnce {
 }
 
 #[test]
+fn panic_in_async_listener_restores_ambient_depth() {
+    let d = EventDispatcher::new().with_max_depth(2);
+    d.add_async_listener::<Ev, _>(0, |_: &mut Ev, _| {
+        Box::pin(async move { panic!("boom") })
+    });
+    let mut e = Ev::default();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = block_on(d.dispatch(&mut e));
+    }));
+    assert!(r.is_err());
+    let d2 = EventDispatcher::new().with_max_depth(2);
+    d2.add_sync_named_listener::<Ev, _>("inner", 0, |e: &mut Ev, _| {
+        e.log.push("inner");
+        Ok(())
+    });
+    d2.add_sync_listener::<Ev, _>(0, |e: &mut Ev, ctx| {
+        block_on(ctx.dispatch_named("inner", e)).unwrap();
+        Ok(())
+    });
+    let mut e2 = Ev::default();
+    block_on(d2.dispatch(&mut e2)).unwrap();
+    assert_eq!(e2.log, vec!["inner"]);
+}
+
+#[test]
 fn parked_dispatch_does_not_inflate_other_dispatch_depth() {
     let d = EventDispatcher::new().with_max_depth(2);
     d.add_sync_named_listener::<Ev, _>("inner", 0, |e: &mut Ev, _| {

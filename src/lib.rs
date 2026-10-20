@@ -125,10 +125,8 @@ impl<F: Future> Future for WithAmbient<F> {
 
     #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<F::Output> {
-        let prev = set_ambient(self.depth);
-        let out = self.inner.as_mut().poll(cx);
-        let _ = AMBIENT.try_with(|c| c.set(prev));
-        out
+        let _guard = AmbientGuard::set(self.depth);
+        self.inner.as_mut().poll(cx)
     }
 }
 
@@ -378,6 +376,8 @@ impl EventDispatcher {
         }
     }
 
+    /// Sets the maximum nested dispatch depth. `0` means the root dispatch
+    /// still runs but any nested dispatch is rejected (it is NOT unlimited).
     pub fn with_max_depth(mut self, max_depth: usize) -> Self {
         self.max_depth = max_depth;
         self
