@@ -64,6 +64,32 @@ fn empty_dispatch_then_add_listener_still_fires() {
 }
 
 #[test]
+fn panic_on_cached_fast_path_leaves_cache_usable() {
+    let d = EventDispatcher::new();
+    d.add_sync_listener::<Ev, _>(0, |e, _| {
+        if e.log.len() == 13 {
+            panic!("boom on cached path");
+        }
+        e.log.push("x");
+        Ok(())
+    });
+    let mut e = Ev::default();
+    block_on(d.dispatch(&mut e)).unwrap();
+    assert_eq!(e.log, vec!["x"]);
+    let mut e13 = Ev { log: vec!["x"; 13] };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = d.dispatch_sync(&mut e13);
+    }));
+    assert!(r.is_err());
+    let mut e2 = Ev::default();
+    block_on(d.dispatch(&mut e2)).unwrap();
+    assert_eq!(e2.log, vec!["x"]);
+    let mut e3 = Ev::default();
+    d.dispatch_sync(&mut e3).unwrap();
+    assert_eq!(e3.log, vec!["x"]);
+}
+
+#[test]
 fn panic_in_async_listener_restores_ambient_depth() {
     let d = EventDispatcher::new().with_max_depth(2);
     d.add_async_listener::<Ev, _>(0, |_: &mut Ev, _| {

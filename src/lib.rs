@@ -258,7 +258,7 @@ enum Backend<'a> {
     Frozen(&'a FrozenState),
 }
 
-type CacheEntry = (u64, Box<str>, TypeId, u64, Option<Arc<[ListenerEntry]>>);
+type CacheEntry = (u64, Box<str>, TypeId, u64, Option<Arc<[ListenerEntry]>>, bool);
 
 thread_local! {
     static CACHE: RefCell<Vec<CacheEntry>> = const { RefCell::new(Vec::new()) };
@@ -274,6 +274,7 @@ fn cache_get(id: u64, event_name: &str, type_id: TypeId, version: u64) -> Option
 }
 
 fn cache_put(id: u64, event_name: &str, type_id: TypeId, version: u64, snap: Option<Arc<[ListenerEntry]>>) {
+    let sync = snap.as_ref().map_or(true, |l| all_sync(l));
     CACHE.with(|c| {
         let Ok(mut c) = c.try_borrow_mut() else {
             return;
@@ -281,12 +282,13 @@ fn cache_put(id: u64, event_name: &str, type_id: TypeId, version: u64, snap: Opt
         if let Some(e) = c.iter_mut().find(|e| e.0 == id && e.2 == type_id && &*e.1 == event_name) {
             e.3 = version;
             e.4 = snap;
+            e.5 = sync;
             return;
         }
         if c.len() >= 64 {
             c.remove(0);
         }
-        c.push((id, event_name.into(), type_id, version, snap));
+        c.push((id, event_name.into(), type_id, version, snap, sync));
     })
 }
 
@@ -325,6 +327,7 @@ fn all_sync(listeners: &[ListenerEntry]) -> bool {
     listeners.iter().all(|e| matches!(&*e.callable, ErasedCallable::Sync(_)))
 }
 
+#[inline]
 fn run_sync_loop<E: Event>(backend: Backend<'_>, max_depth: usize, event: &mut E, listeners: &[ListenerEntry], depth: usize) -> Result<(), DispatchError> {
     let _ambient = AmbientGuard::set(depth);
     let mut ctx = DispatchContext { backend, stopped: false, depth, max_depth };
@@ -354,20 +357,55 @@ async fn run_async_loop<E: Event>(backend: Backend<'_>, max_depth: usize, listen
     Ok(())
 }
 
+#[inline]
 fn try_fast_sync<E: Event>(backend: Backend<'_>, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Option<Result<(), DispatchError>> {
-    match fetch(backend, event_name, TypeId::of::<E>()) {
-        None => Some(Ok(())),
-        Some(l) if all_sync(&l) => Some(run_sync_loop(backend, max_depth, event, &l, depth)),
-        Some(_) => None,
+    enum Probe {
+        Done(Result<(), DispatchError>),
+        HasAsync,
+        Miss,
+    }
+    let type_id = TypeId::of::<E>();
+    let (id, version) = match backend {
+        Backend::Live(inner) => (inner.id, inner.version.load(Ordering::Acquire)),
+        Backend::Frozen(state) => (state.id, 0),
+    };
+    // On an all-sync cache hit the loop runs while borrowing the entry, so
+    // the hot path never clones the snapshot Arc. Listeners may re-enter:
+    // nested cache access then fails its try_borrow and falls back to the
+    // locked fetch path, which stays correct (just uncached).
+    let probe = CACHE
+        .try_with(|c| {
+            let Ok(cache) = c.try_borrow() else {
+                return Probe::Miss;
+            };
+            for e in cache.iter() {
+                if e.0 == id && e.3 == version && e.2 == type_id && &*e.1 == event_name {
+                    if !e.5 {
+                        return Probe::HasAsync;
+                    }
+                    return Probe::Done(match &e.4 {
+                        None => Ok(()),
+                        Some(l) => run_sync_loop(backend, max_depth, event, l, depth),
+                    });
+                }
+            }
+            Probe::Miss
+        })
+        .unwrap_or(Probe::Miss);
+    match probe {
+        Probe::Done(r) => Some(r),
+        Probe::HasAsync => None,
+        Probe::Miss => match fetch(backend, event_name, type_id) {
+            None => Some(Ok(())),
+            Some(l) if all_sync(&l) => Some(run_sync_loop(backend, max_depth, event, &l, depth)),
+            Some(_) => None,
+        },
     }
 }
 
+#[inline]
 fn dispatch_sync_from<E: Event>(backend: Backend<'_>, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
-    match fetch(backend, event_name, TypeId::of::<E>()) {
-        None => Ok(()),
-        Some(l) if all_sync(&l) => run_sync_loop(backend, max_depth, event, &l, depth),
-        Some(_) => Err(DispatchError::SyncDispatchUnavailable),
-    }
+    try_fast_sync(backend, max_depth, event_name, event, depth).unwrap_or(Err(DispatchError::SyncDispatchUnavailable))
 }
 
 fn dispatch_async_from<'a, E: Event>(backend: Backend<'a>, max_depth: usize, listeners: &'a [ListenerEntry], event: &'a mut E, depth: usize) -> WithAmbient<impl Future<Output = Result<(), DispatchError>> + 'a> {
@@ -526,7 +564,6 @@ impl EventDispatcher {
     }
 
     #[inline]
-    #[inline]
     pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
         let depth = check_depth(ambient_depth() + 1, self.max_depth)?;
         let backend = Backend::Live(&self.inner);
@@ -578,7 +615,6 @@ impl ImmutableEventDispatcher {
         self.dispatch_named(E::default_name(), event).await
     }
 
-    #[inline]
     #[inline]
     pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
         let depth = check_depth(ambient_depth() + 1, self.max_depth)?;
