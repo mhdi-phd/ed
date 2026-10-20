@@ -290,8 +290,13 @@ fn cache_put(id: u64, event_name: &str, type_id: TypeId, version: u64, snap: Opt
             e.5 = sync;
             return;
         }
+        // FIFO eviction: at most 63 small entries shift, and cache_put is
+        // a cold path (probe miss), so the memmove is irrelevant. Do NOT
+        // swap_remove here: it would move the newest entry into slot 0 and
+        // evict exactly that entry on the next insert, pinning the oldest
+        // entries forever.
         if c.len() >= 64 {
-            c.swap_remove(0);
+            c.remove(0);
         }
         c.push((id, event_name.into(), type_id, version, snap, sync));
     })
@@ -699,6 +704,30 @@ impl ImmutableEventDispatcher {
 
 pub trait EventSubscriber: Send + Sync + 'static {
     fn register(&self, dispatcher: &EventDispatcher);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TEv;
+    impl Event for TEv {}
+
+    #[test]
+    fn cache_eviction_is_fifo() {
+        let tid = TypeId::of::<TEv>();
+        for i in 0..66 {
+            cache_put(42, &format!("k{i}"), tid, 0, None);
+        }
+        // 66 inserts into a 64-entry FIFO cache evict k0 and k1 only; in
+        // particular k63 (the newest entry when the cache first filled)
+        // must still be present — swap_remove eviction evicted it instead.
+        assert!(cache_get(42, "k0", tid, 0).is_none());
+        assert!(cache_get(42, "k1", tid, 0).is_none());
+        assert!(cache_get(42, "k2", tid, 0).is_some());
+        assert!(cache_get(42, "k63", tid, 0).is_some());
+        assert!(cache_get(42, "k65", tid, 0).is_some());
+    }
 }
 
 impl EventDispatcher {
