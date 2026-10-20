@@ -234,11 +234,15 @@ struct StateInner {
     id: u64,
     version: AtomicU64,
     buckets: RwLock<Buckets>,
+    // Reverse index so remove_listener and listener_priority locate the
+    // owning bucket in O(1) instead of scanning every bucket. The buckets
+    // and index locks are never held at the same time.
+    index: RwLock<HashMap<ListenerId, (Box<str>, TypeId)>>,
 }
 
 impl StateInner {
     fn new() -> Self {
-        Self { id: next_id(), version: AtomicU64::new(0), buckets: RwLock::new(HashMap::new()) }
+        Self { id: next_id(), version: AtomicU64::new(0), buckets: RwLock::new(HashMap::new()), index: RwLock::new(HashMap::new()) }
     }
 
     #[inline]
@@ -250,6 +254,7 @@ impl StateInner {
 struct FrozenState {
     id: u64,
     buckets: HashMap<Box<str>, HashMap<TypeId, Arc<[ListenerEntry]>>>,
+    index: HashMap<ListenerId, (Box<str>, TypeId)>,
 }
 
 #[derive(Clone, Copy)]
@@ -286,7 +291,7 @@ fn cache_put(id: u64, event_name: &str, type_id: TypeId, version: u64, snap: Opt
             return;
         }
         if c.len() >= 64 {
-            c.remove(0);
+            c.swap_remove(0);
         }
         c.push((id, event_name.into(), type_id, version, snap, sync));
     })
@@ -488,8 +493,11 @@ impl EventDispatcher {
 
     fn add_entry<E: Event>(&self, event_name: &str, entry: ListenerEntry) -> ListenerId {
         let id = entry.id;
-        let mut buckets = self.inner.buckets.write().unwrap_or_else(|e| e.into_inner());
-        buckets.entry(event_name.into()).or_default().entry(TypeId::of::<E>()).or_default().add(entry);
+        {
+            let mut buckets = self.inner.buckets.write().unwrap_or_else(|e| e.into_inner());
+            buckets.entry(event_name.into()).or_default().entry(TypeId::of::<E>()).or_default().add(entry);
+        }
+        self.inner.index.write().unwrap_or_else(|e| e.into_inner()).insert(id, (event_name.into(), TypeId::of::<E>()));
         self.inner.bump();
         id
     }
@@ -532,30 +540,55 @@ impl EventDispatcher {
     }
 
     pub fn remove_listener(&self, id: ListenerId) -> bool {
-        let mut buckets = self.inner.buckets.write().unwrap_or_else(|e| e.into_inner());
-        let mut located: Option<(Box<str>, TypeId)> = None;
-        'search: for (name, by_type) in buckets.iter() {
-            for (type_id, bucket) in by_type.iter() {
-                if bucket.raw.iter().any(|e| e.id == id) {
-                    located = Some((name.clone(), *type_id));
-                    break 'search;
-                }
-            }
-        }
+        // The index claims the ID first: a racing second removal observes
+        // false, and no other path can resurrect the entry afterwards.
+        let located = self.inner.index.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
         let Some((name, type_id)) = located else {
             return false;
         };
-        let by_type = buckets.get_mut(&*name).expect("located above");
-        let bucket = by_type.get_mut(&type_id).expect("located above");
-        bucket.remove(id);
-        if bucket.raw.is_empty() {
-            by_type.remove(&type_id);
+        let mut buckets = self.inner.buckets.write().unwrap_or_else(|e| e.into_inner());
+        let mut drop_type = false;
+        let mut drop_name = false;
+        if let Some(by_type) = buckets.get_mut(&*name) {
+            if let Some(bucket) = by_type.get_mut(&type_id) {
+                bucket.remove(id);
+                drop_type = bucket.raw.is_empty();
+            }
+            if drop_type {
+                by_type.remove(&type_id);
+            }
+            drop_name = by_type.is_empty();
         }
-        if by_type.is_empty() {
+        if drop_name {
             buckets.remove(&*name);
         }
+        drop(buckets);
         self.inner.bump();
         true
+    }
+
+    pub fn has_listeners<E: Event>(&self) -> bool {
+        self.has_named_listeners::<E>(E::default_name())
+    }
+
+    pub fn has_named_listeners<E: Event>(&self, event_name: &str) -> bool {
+        self.named_listener_count::<E>(event_name) > 0
+    }
+
+    pub fn listener_count<E: Event>(&self) -> usize {
+        self.named_listener_count::<E>(E::default_name())
+    }
+
+    pub fn named_listener_count<E: Event>(&self, event_name: &str) -> usize {
+        let buckets = self.inner.buckets.read().unwrap_or_else(|e| e.into_inner());
+        buckets.get(event_name).and_then(|m| m.get(&TypeId::of::<E>())).map_or(0, |b| b.raw.len())
+    }
+
+    pub fn listener_priority(&self, id: ListenerId) -> Option<i32> {
+        let located = self.inner.index.read().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
+        let (name, type_id) = located?;
+        let buckets = self.inner.buckets.read().unwrap_or_else(|e| e.into_inner());
+        buckets.get(&*name)?.get(&type_id)?.raw.iter().find(|e| e.id == id).map(|e| e.priority)
     }
 
     #[inline]
@@ -588,18 +621,23 @@ impl EventDispatcher {
     pub fn freeze(&self) -> ImmutableEventDispatcher {
         let mut buckets = self.inner.buckets.write().unwrap_or_else(|e| e.into_inner());
         let mut frozen: HashMap<Box<str>, HashMap<TypeId, Arc<[ListenerEntry]>>> = HashMap::with_capacity(buckets.len());
+        let mut index: HashMap<ListenerId, (Box<str>, TypeId)> = HashMap::new();
         for (name, by_type) in buckets.iter_mut() {
             let mut types: HashMap<TypeId, Arc<[ListenerEntry]>> = HashMap::with_capacity(by_type.len());
             for (type_id, bucket) in by_type.iter_mut() {
                 if !bucket.raw.is_empty() {
-                    types.insert(*type_id, bucket.get_sorted());
+                    let sorted = bucket.get_sorted();
+                    for entry in sorted.iter() {
+                        index.insert(entry.id, (name.clone(), *type_id));
+                    }
+                    types.insert(*type_id, sorted);
                 }
             }
             if !types.is_empty() {
                 frozen.insert(name.clone(), types);
             }
         }
-        ImmutableEventDispatcher { state: Arc::new(FrozenState { id: next_id(), buckets: frozen }), max_depth: self.max_depth }
+        ImmutableEventDispatcher { state: Arc::new(FrozenState { id: next_id(), buckets: frozen, index }), max_depth: self.max_depth }
     }
 }
 
@@ -635,6 +673,27 @@ impl ImmutableEventDispatcher {
     pub fn dispatch_sync_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
         let depth = check_depth(ambient_depth() + 1, self.max_depth)?;
         dispatch_sync_from(Backend::Frozen(&self.state), self.max_depth, event_name, event, depth)
+    }
+
+    pub fn has_listeners<E: Event>(&self) -> bool {
+        self.has_named_listeners::<E>(E::default_name())
+    }
+
+    pub fn has_named_listeners<E: Event>(&self, event_name: &str) -> bool {
+        self.named_listener_count::<E>(event_name) > 0
+    }
+
+    pub fn listener_count<E: Event>(&self) -> usize {
+        self.named_listener_count::<E>(E::default_name())
+    }
+
+    pub fn named_listener_count<E: Event>(&self, event_name: &str) -> usize {
+        self.state.buckets.get(event_name).and_then(|m| m.get(&TypeId::of::<E>())).map_or(0, |l| l.len())
+    }
+
+    pub fn listener_priority(&self, id: ListenerId) -> Option<i32> {
+        let (name, type_id) = self.state.index.get(&id)?;
+        self.state.buckets.get(&**name)?.get(type_id)?.iter().find(|e| e.id == id).map(|e| e.priority)
     }
 }
 

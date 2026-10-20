@@ -582,3 +582,90 @@ fn remove_by_id_keeps_other_type_under_shared_name() {
     assert_eq!(o.n, 10);
     assert!(d.remove_listener(id_other));
 }
+
+#[test]
+fn query_api_reflects_add_and_remove() {
+    let d = new_disp();
+    assert!(!d.has_listeners::<Ev>());
+    assert_eq!(d.listener_count::<Ev>(), 0);
+    let a = d.add_sync_listener::<Ev, _>(7, |e, _| {
+        e.log.push("a");
+        Ok(())
+    });
+    let b = d.add_sync_named_listener::<Ev, _>("custom", -3, |e, _| {
+        e.log.push("b");
+        Ok(())
+    });
+    d.add_sync_listener::<Other, _>(1, |e, _| {
+        e.n += 1;
+        Ok(())
+    });
+    assert!(d.has_listeners::<Ev>());
+    assert_eq!(d.listener_count::<Ev>(), 1);
+    assert_eq!(d.named_listener_count::<Ev>("custom"), 1);
+    assert!(d.has_named_listeners::<Ev>("custom"));
+    assert_eq!(d.listener_count::<Other>(), 1);
+    assert_eq!(d.listener_priority(a), Some(7));
+    assert_eq!(d.listener_priority(b), Some(-3));
+    let foreign = new_disp().add_sync_listener::<Ev, _>(1, |_, _| Ok(()));
+    assert_eq!(d.listener_priority(foreign), None);
+    assert!(d.remove_listener(a));
+    assert!(!d.has_listeners::<Ev>());
+    assert_eq!(d.listener_count::<Ev>(), 0);
+    assert_eq!(d.listener_priority(a), None);
+    assert!(!d.remove_listener(a));
+    assert_eq!(d.named_listener_count::<Ev>("custom"), 1);
+    assert_eq!(d.listener_priority(b), Some(-3));
+}
+
+#[test]
+fn frozen_query_api_matches_live() {
+    let d = new_disp();
+    let a = d.add_sync_listener::<Ev, _>(5, |e, _| {
+        e.log.push("a");
+        Ok(())
+    });
+    d.add_sync_named_listener::<Ev, _>("custom", 9, |e, _| {
+        e.log.push("b");
+        Ok(())
+    });
+    let f = d.freeze();
+    assert!(f.has_listeners::<Ev>());
+    assert_eq!(f.listener_count::<Ev>(), 1);
+    assert_eq!(f.named_listener_count::<Ev>("custom"), 1);
+    assert_eq!(f.listener_priority(a), Some(5));
+    let foreign = new_disp().add_sync_listener::<Ev, _>(1, |_, _| Ok(()));
+    assert_eq!(f.listener_priority(foreign), None);
+    assert!(!f.has_listeners::<Other>());
+}
+
+#[test]
+fn indexed_removal_across_names_and_types() {
+    let d = new_disp();
+    let mut ids = Vec::new();
+    for name in ["n1", "n2", "n3"] {
+        ids.push(d.add_sync_named_listener::<Ev, _>(name, 0, |e, _| {
+            e.n += 1;
+            Ok(())
+        }));
+        ids.push(d.add_sync_named_listener::<Other, _>(name, 0, |e, _| {
+            e.n += 10;
+            Ok(())
+        }));
+    }
+    for id in [ids[0], ids[3], ids[4]] {
+        assert!(d.remove_listener(id));
+    }
+    assert_eq!(d.named_listener_count::<Ev>("n1"), 0);
+    assert_eq!(d.named_listener_count::<Other>("n1"), 1);
+    assert_eq!(d.named_listener_count::<Ev>("n2"), 1);
+    assert_eq!(d.named_listener_count::<Other>("n2"), 0);
+    assert_eq!(d.named_listener_count::<Ev>("n3"), 0);
+    assert_eq!(d.named_listener_count::<Other>("n3"), 1);
+    let mut e = Ev::default();
+    block_on(d.dispatch_named::<Ev>("n2", &mut e)).unwrap();
+    assert_eq!(e.n, 1);
+    let mut o = Other::default();
+    block_on(d.dispatch_named::<Other>("n3", &mut o)).unwrap();
+    assert_eq!(o.n, 10);
+}

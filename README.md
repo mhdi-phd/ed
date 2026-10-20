@@ -41,7 +41,9 @@ Symfony-PHP `dispatch` ≈ 195ns (1 listener).
 ## Rules that matter
 
 - Listener identity is the numeric `ListenerId` (globally unique).
-  `remove_listener(id)` removes by ID.
+  `remove_listener(id)` removes by ID in O(1) via a reverse index.
+- Both dispatchers answer queries: `has_listeners` / `has_named_listeners`,
+  `listener_count` / `named_listener_count`, and `listener_priority(id)`.
 - `with_max_depth(n)` bounds the *total* dispatch depth including the root
   dispatch (default 128): `with_max_depth(2)` allows the root plus one
   nested level. `0` is clamped to `1` (root only), so `0` and `1` behave the
