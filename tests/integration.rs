@@ -669,3 +669,19 @@ fn indexed_removal_across_names_and_types() {
     block_on(d.dispatch_named::<Other>("n3", &mut o)).unwrap();
     assert_eq!(o.n, 10);
 }
+
+#[test]
+fn listeners_listing_is_in_dispatch_order() {
+    let d = new_disp();
+    let a = d.add_sync_listener::<Ev, _>(-10, |_, _| Ok(()));
+    let b = d.add_sync_listener::<Ev, _>(10, |_, _| Ok(()));
+    let c = d.add_sync_listener::<Ev, _>(10, |_, _| Ok(()));
+    // Highest priority first; the tie keeps registration order (FIFO).
+    let expected = vec![(b, 10), (c, 10), (a, -10)];
+    assert_eq!(d.listeners::<Ev>(), expected);
+    assert_eq!(d.named_listeners::<Ev>("nope"), Vec::<(ListenerId, i32)>::new());
+    let f = d.freeze();
+    assert_eq!(f.listeners::<Ev>(), expected);
+    assert!(d.remove_listener(b));
+    assert_eq!(d.listeners::<Ev>(), vec![(c, 10), (a, -10)]);
+}

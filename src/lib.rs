@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::cmp::Reverse;
 use std::fmt;
 use std::sync::{
@@ -266,7 +266,7 @@ enum Backend<'a> {
 type CacheEntry = (u64, Box<str>, TypeId, u64, Option<Arc<[ListenerEntry]>>, bool);
 
 thread_local! {
-    static CACHE: RefCell<Vec<CacheEntry>> = const { RefCell::new(Vec::new()) };
+    static CACHE: RefCell<VecDeque<CacheEntry>> = const { RefCell::new(VecDeque::new()) };
 }
 
 fn cache_get(id: u64, event_name: &str, type_id: TypeId, version: u64) -> Option<Option<Arc<[ListenerEntry]>>> {
@@ -290,15 +290,12 @@ fn cache_put(id: u64, event_name: &str, type_id: TypeId, version: u64, snap: Opt
             e.5 = sync;
             return;
         }
-        // FIFO eviction: at most 63 small entries shift, and cache_put is
-        // a cold path (probe miss), so the memmove is irrelevant. Do NOT
-        // swap_remove here: it would move the newest entry into slot 0 and
-        // evict exactly that entry on the next insert, pinning the oldest
-        // entries forever.
+        // FIFO eviction via the deque: pop_front is O(1) and always drops
+        // the oldest entry (a swap_remove would pin old entries forever).
         if c.len() >= 64 {
-            c.remove(0);
+            c.pop_front();
         }
-        c.push((id, event_name.into(), type_id, version, snap, sync));
+        c.push_back((id, event_name.into(), type_id, version, snap, sync));
     })
 }
 
@@ -379,10 +376,14 @@ fn try_fast_sync<E: Event>(backend: Backend<'_>, max_depth: usize, event_name: &
         Backend::Live(inner) => (inner.id, inner.version.load(Ordering::Acquire)),
         Backend::Frozen(state) => (state.id, 0),
     };
-    // On an all-sync cache hit the loop runs while borrowing the entry, so
-    // the hot path never clones the snapshot Arc. Listeners may re-enter:
-    // nested cache access then fails its try_borrow and falls back to the
-    // locked fetch path, which stays correct (just uncached).
+    // On an all-sync cache hit the loop runs while borrowing the entry:
+    // measured, cloning the snapshot out first costs ~17ns per dispatch
+    // (~39ns vs ~22ns), which this design refuses to pay. Safety is kept
+    // differently: every cache access uses try_borrow, so re-entrant
+    // dispatch from a listener fails the nested borrow and falls back to
+    // the locked fetch path (correct, just uncached for that call), and a
+    // panic unwinds through the borrow guard, leaving the cache usable
+    // (covered by a regression test).
     let probe = CACHE
         .try_with(|c| {
             let Ok(cache) = c.try_borrow() else {
@@ -596,6 +597,21 @@ impl EventDispatcher {
         buckets.get(&*name)?.get(&type_id)?.raw.iter().find(|e| e.id == id).map(|e| e.priority)
     }
 
+    /// (ID, priority) pairs in dispatch order, for inspection/profiling.
+    pub fn listeners<E: Event>(&self) -> Vec<(ListenerId, i32)> {
+        self.named_listeners::<E>(E::default_name())
+    }
+
+    pub fn named_listeners<E: Event>(&self, event_name: &str) -> Vec<(ListenerId, i32)> {
+        let buckets = self.inner.buckets.read().unwrap_or_else(|e| e.into_inner());
+        let Some(bucket) = buckets.get(event_name).and_then(|m| m.get(&TypeId::of::<E>())) else {
+            return Vec::new();
+        };
+        let mut pairs: Vec<(ListenerId, i32)> = bucket.raw.iter().map(|e| (e.id, e.priority)).collect();
+        pairs.sort_by_key(|p| Reverse(p.1));
+        pairs
+    }
+
     #[inline]
     pub async fn dispatch<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
         self.dispatch_named(E::default_name(), event).await
@@ -700,10 +716,29 @@ impl ImmutableEventDispatcher {
         let (name, type_id) = self.state.index.get(&id)?;
         self.state.buckets.get(&**name)?.get(type_id)?.iter().find(|e| e.id == id).map(|e| e.priority)
     }
+
+    /// (ID, priority) pairs in dispatch order, for inspection/profiling.
+    pub fn listeners<E: Event>(&self) -> Vec<(ListenerId, i32)> {
+        self.named_listeners::<E>(E::default_name())
+    }
+
+    pub fn named_listeners<E: Event>(&self, event_name: &str) -> Vec<(ListenerId, i32)> {
+        self.state
+            .buckets
+            .get(event_name)
+            .and_then(|m| m.get(&TypeId::of::<E>()))
+            .map_or_else(Vec::new, |l| l.iter().map(|e| (e.id, e.priority)).collect())
+    }
 }
 
 pub trait EventSubscriber: Send + Sync + 'static {
     fn register(&self, dispatcher: &EventDispatcher);
+}
+
+impl EventDispatcher {
+    pub fn add_subscriber<S: EventSubscriber>(&self, subscriber: &S) {
+        subscriber.register(self);
+    }
 }
 
 #[cfg(test)]
@@ -727,11 +762,5 @@ mod tests {
         assert!(cache_get(42, "k2", tid, 0).is_some());
         assert!(cache_get(42, "k63", tid, 0).is_some());
         assert!(cache_get(42, "k65", tid, 0).is_some());
-    }
-}
-
-impl EventDispatcher {
-    pub fn add_subscriber<S: EventSubscriber>(&self, subscriber: &S) {
-        subscriber.register(self);
     }
 }

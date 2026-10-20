@@ -43,7 +43,14 @@ Symfony-PHP `dispatch` ≈ 195ns (1 listener).
 - Listener identity is the numeric `ListenerId` (globally unique).
   `remove_listener(id)` removes by ID in O(1) via a reverse index.
 - Both dispatchers answer queries: `has_listeners` / `has_named_listeners`,
-  `listener_count` / `named_listener_count`, and `listener_priority(id)`.
+  `listener_count` / `named_listener_count`, `listener_priority(id)`, and
+  `listeners` / `named_listeners` returning (ID, priority) pairs in
+  dispatch order for inspection and profiling.
+- Cache invalidation uses one version counter per dispatcher: any
+  add/remove makes every thread re-fetch each event once, then the cache
+  is warm again. Per-bucket versions would need a lock-free version
+  registry and are deliberately not paid for; registration is expected
+  to be front-loaded, dispatch steady-state.
 - `with_max_depth(n)` bounds the *total* dispatch depth including the root
   dispatch (default 128): `with_max_depth(2)` allows the root plus one
   nested level. `0` is clamped to `1` (root only), so `0` and `1` behave the
