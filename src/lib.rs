@@ -526,6 +526,7 @@ impl EventDispatcher {
     }
 
     #[inline]
+    #[inline]
     pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
         let depth = check_depth(ambient_depth() + 1, self.max_depth)?;
         let backend = Backend::Live(&self.inner);
@@ -577,6 +578,7 @@ impl ImmutableEventDispatcher {
         self.dispatch_named(E::default_name(), event).await
     }
 
+    #[inline]
     #[inline]
     pub async fn dispatch_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
         let depth = check_depth(ambient_depth() + 1, self.max_depth)?;

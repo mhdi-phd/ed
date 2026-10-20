@@ -29,7 +29,7 @@ depth guard that cannot be bypassed.
 
 | listeners | per dispatch |
 |----------:|-------------:|
-| 1         | ~42ns        |
+| 1         | ~44ns        |
 | 8         | ~71ns        |
 | 64        | ~395ns       |
 
