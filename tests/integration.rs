@@ -284,7 +284,7 @@ fn empty_dispatch_ok() {
 fn subscriber_api() {
     struct S;
     impl EventSubscriber for S {
-        fn register(d: &EventDispatcher) {
+        fn register(&self, d: &EventDispatcher) {
             d.add_sync_listener::<Ev, _>(0, |e, _| {
                 e.log.push("s1");
                 Ok(())
@@ -292,10 +292,126 @@ fn subscriber_api() {
         }
     }
     let d = new_disp();
-    d.add_subscriber::<S>();
+    d.add_subscriber(&S);
     let mut e = Ev::default();
     block_on(d.dispatch(&mut e)).unwrap();
     assert_eq!(e.log, vec!["s1"]);
+}
+
+#[test]
+fn subscriber_with_state() {
+    struct Greeter {
+        hits: Arc<AtomicUsize>,
+    }
+    impl EventSubscriber for Greeter {
+        fn register(&self, d: &EventDispatcher) {
+            let hits = self.hits.clone();
+            d.add_sync_listener::<Ev, _>(0, move |e, _| {
+                hits.fetch_add(1, Ordering::SeqCst);
+                e.log.push("greeted");
+                Ok(())
+            });
+        }
+    }
+    let d = new_disp();
+    let g = Greeter { hits: Arc::new(AtomicUsize::new(0)) };
+    let hits = g.hits.clone();
+    d.add_subscriber(&g);
+    let mut e = Ev::default();
+    block_on(d.dispatch(&mut e)).unwrap();
+    assert_eq!(e.log, vec!["greeted"]);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn nested_dispatch_sync_via_ctx() {
+    let d = new_disp();
+    d.add_sync_named_listener::<Ev, _>("inner", 0, |e, _| {
+        e.log.push("inner");
+        Ok(())
+    });
+    d.add_sync_named_listener::<Ev, _>("outer", 0, |e, ctx| {
+        e.log.push("outer");
+        ctx.dispatch_sync_named("inner", e).unwrap();
+        e.log.push("outer-after");
+        Ok(())
+    });
+    let mut e = Ev::default();
+    block_on(d.dispatch_named::<Ev>("outer", &mut e)).unwrap();
+    assert_eq!(e.log, vec!["outer", "inner", "outer-after"]);
+}
+
+#[test]
+fn ctx_dispatch_sync_depth_limit() {
+    let d = new_disp().with_max_depth(2);
+    d.add_sync_listener::<Ev, _>(0, |e, ctx| {
+        let r = ctx.dispatch_sync(e);
+        assert!(matches!(r, Ok(()) | Err(DispatchError::MaxDepthExceeded(_))));
+        if ctx.depth() == 2 {
+            assert!(matches!(r, Err(DispatchError::MaxDepthExceeded(_))));
+        }
+        Ok(())
+    });
+    let mut e = Ev::default();
+    block_on(d.dispatch(&mut e)).unwrap();
+}
+
+#[test]
+fn ctx_dispatch_sync_rejects_async_listeners() {
+    let d = new_disp();
+    d.add_async_named_listener::<Ev, _>("async-ev", 0, |_: &mut Ev, _| {
+        Box::pin(async move { Ok(()) })
+    });
+    d.add_sync_listener::<Ev, _>(0, |e, ctx| {
+        let r = ctx.dispatch_sync_named("async-ev", e);
+        assert!(matches!(r, Err(DispatchError::SyncDispatchUnavailable)));
+        Ok(())
+    });
+    let mut e = Ev::default();
+    block_on(d.dispatch(&mut e)).unwrap();
+}
+
+#[test]
+fn frozen_dispatch_sync_works_and_rejects_async() {
+    let d = new_disp();
+    d.add_sync_listener::<Ev, _>(0, |e, _| {
+        e.log.push("s");
+        Ok(())
+    });
+    let f = d.freeze();
+    let mut e = Ev::default();
+    f.dispatch_sync(&mut e).unwrap();
+    assert_eq!(e.log, vec!["s"]);
+    let d2 = new_disp();
+    d2.add_async_listener::<Ev, _>(0, |_: &mut Ev, _| {
+        Box::pin(async move { Ok(()) })
+    });
+    let f2 = d2.freeze();
+    let mut e2 = Ev::default();
+    assert!(matches!(f2.dispatch_sync(&mut e2), Err(DispatchError::SyncDispatchUnavailable)));
+}
+
+#[test]
+fn remove_listener_by_id_only() {
+    let d = new_disp();
+    let a = d.add_sync_listener::<Ev, _>(0, |e, _| {
+        e.log.push("a");
+        Ok(())
+    });
+    let b = d.add_sync_named_listener::<Ev, _>("named", 0, |e, _| {
+        e.log.push("b");
+        Ok(())
+    });
+    assert!(d.remove_listener_by_id(a));
+    assert!(!d.remove_listener_by_id(a));
+    assert_eq!(d.listener_count::<Ev>(), 0);
+    let mut e = Ev::default();
+    block_on(d.dispatch_named::<Ev>("named", &mut e)).unwrap();
+    assert_eq!(e.log, vec!["b"]);
+    assert!(d.remove_listener_by_id(b));
+    let mut e2 = Ev::default();
+    block_on(d.dispatch_named::<Ev>("named", &mut e2)).unwrap();
+    assert!(e2.log.is_empty());
 }
 
 #[test]

@@ -218,6 +218,17 @@ impl EventBucket {
         }
     }
 
+    fn remove_any(&mut self, id: ListenerId) -> bool {
+        let before = self.raw.len();
+        self.raw.retain(|e| e.id != id);
+        if self.raw.len() != before {
+            self.sorted = None;
+            true
+        } else {
+            false
+        }
+    }
+
     fn get_sorted(&mut self) -> Arc<[ListenerEntry]> {
         if let Some(ref cached) = self.sorted {
             return Arc::clone(cached);
@@ -351,6 +362,25 @@ impl<'a> DispatchContext<'a> {
             Backend::Frozen(state) => {
                 ImmutableEventDispatcher::dispatch_frozen_inner(state, self.max_depth, event_name, event, depth)
                 .await
+            }
+        }
+    }
+
+    pub fn dispatch_sync<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
+        self.dispatch_sync_named(E::default_name(), event)
+    }
+
+    pub fn dispatch_sync_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
+        let depth = self.depth + 1;
+        if depth > depth_limit(self.max_depth) {
+            return Err(DispatchError::MaxDepthExceeded(self.max_depth));
+        }
+        match self.backend {
+            Backend::Live(inner) => {
+                EventDispatcher::dispatch_sync_inner(inner, self.max_depth, event_name, event, depth)
+            }
+            Backend::Frozen(state) => {
+                ImmutableEventDispatcher::dispatch_frozen_sync_inner(state, self.max_depth, event_name, event, depth)
             }
         }
     }
@@ -501,6 +531,31 @@ impl EventDispatcher {
     pub fn dispatch_sync_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
         let depth = entry_depth(self.max_depth)?;
         Self::dispatch_sync_inner(&self.inner, self.max_depth, event_name, event, depth)
+    }
+
+    pub fn remove_listener_by_id(&self, id: ListenerId) -> bool {
+        let removed = {
+            let mut buckets = self.inner.buckets.write().unwrap_or_else(|e| e.into_inner());
+            let mut found = false;
+            let mut empty: Option<Box<str>> = None;
+            for (name, bucket) in buckets.iter_mut() {
+                if bucket.remove_any(id) {
+                    found = true;
+                    if bucket.raw.is_empty() {
+                        empty = Some(name.clone());
+                    }
+                    break;
+                }
+            }
+            if let Some(name) = empty {
+                buckets.remove(&*name);
+            }
+            found
+        };
+        if removed {
+            self.inner.bump();
+        }
+        removed
     }
 
     fn dispatch_sync_inner<E: Event>(inner: &StateInner, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
@@ -687,6 +742,41 @@ impl ImmutableEventDispatcher {
         Self::dispatch_frozen_inner(&self.state, self.max_depth, event_name, event, depth).await
     }
 
+    pub fn dispatch_sync<E: Event>(&self, event: &mut E) -> Result<(), DispatchError> {
+        self.dispatch_sync_named(E::default_name(), event)
+    }
+
+    pub fn dispatch_sync_named<E: Event>(&self, event_name: &str, event: &mut E) -> Result<(), DispatchError> {
+        let depth = entry_depth(self.max_depth)?;
+        Self::dispatch_frozen_sync_inner(&self.state, self.max_depth, event_name, event, depth)
+    }
+
+    fn dispatch_frozen_sync_inner<E: Event>(state: &FrozenState, max_depth: usize, event_name: &str, event: &mut E, depth: usize) -> Result<(), DispatchError> {
+        if let Some(r) = EventDispatcher::try_sync_dispatch(Backend::Frozen(state), state.generation, 0, max_depth, event_name, event, depth) {
+            return r;
+        }
+        let generation = state.generation;
+        let listeners = match fast_lookup(generation, event_name, 0) {
+            Some(listeners) => listeners,
+            None => {
+                let listeners = state.buckets.get(event_name).cloned();
+                fast_store(generation, event_name, 0, listeners.clone());
+                listeners
+            }
+        };
+        let listeners = match listeners {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        if !listeners
+            .iter()
+            .all(|e| matches!(&*e.callable, ErasedCallable::Sync(_)))
+        {
+            return Err(DispatchError::SyncDispatchUnavailable);
+        }
+        EventDispatcher::run_sync_loop(Backend::Frozen(state), max_depth, event, &listeners, depth)
+    }
+
     #[inline]
     fn dispatch_frozen_inner<'a, E: Event>(state: &'a FrozenState, max_depth: usize, event_name: &'a str, event: &'a mut E, depth: usize) -> WithAmbient<impl Future<Output = Result<(), DispatchError>> + 'a> {
         WithAmbient::new(Self::dispatch_frozen_impl(state, max_depth, event_name, event, depth), depth)
@@ -730,11 +820,11 @@ impl ImmutableEventDispatcher {
 }
 
 pub trait EventSubscriber: Send + Sync + 'static {
-    fn register(dispatcher: &EventDispatcher);
+    fn register(&self, dispatcher: &EventDispatcher);
 }
 
 impl EventDispatcher {
-    pub fn add_subscriber<S: EventSubscriber>(&self) {
-        S::register(self);
+    pub fn add_subscriber<S: EventSubscriber>(&self, subscriber: &S) {
+        subscriber.register(self);
     }
 }
