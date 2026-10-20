@@ -293,18 +293,24 @@ fn empty_dispatch_ok() {
 fn subscriber_api() {
     struct S;
     impl EventSubscriber for S {
-        fn register(&self, d: &EventDispatcher) {
-            d.add_sync_listener::<Ev, _>(0, |e, _| {
+        fn register(&self, d: &EventDispatcher) -> Vec<ListenerId> {
+            vec![d.add_sync_listener::<Ev, _>(0, |e, _| {
                 e.log.push("s1");
                 Ok(())
-            });
+            })]
         }
     }
     let d = new_disp();
-    d.add_subscriber(&S);
+    let ids = d.add_subscriber(&S);
+    assert_eq!(ids.len(), 1);
     let mut e = Ev::default();
     block_on(d.dispatch(&mut e)).unwrap();
     assert_eq!(e.log, vec!["s1"]);
+    assert_eq!(d.remove_listeners(&ids), 1);
+    assert_eq!(d.remove_listeners(&ids), 0);
+    let mut e2 = Ev::default();
+    block_on(d.dispatch(&mut e2)).unwrap();
+    assert!(e2.log.is_empty());
 }
 
 #[test]
@@ -313,13 +319,13 @@ fn subscriber_with_state() {
         hits: Arc<AtomicUsize>,
     }
     impl EventSubscriber for Greeter {
-        fn register(&self, d: &EventDispatcher) {
+        fn register(&self, d: &EventDispatcher) -> Vec<ListenerId> {
             let hits = self.hits.clone();
-            d.add_sync_listener::<Ev, _>(0, move |e, _| {
+            vec![d.add_sync_listener::<Ev, _>(0, move |e, _| {
                 hits.fetch_add(1, Ordering::SeqCst);
                 e.log.push("greeted");
                 Ok(())
-            });
+            })]
         }
     }
     let d = new_disp();

@@ -132,15 +132,16 @@ impl<F: Future> Future for WithAmbient<F> {
     }
 }
 
-type SyncFn = Box<
+type SyncFn = Arc<
     dyn Fn(&mut (dyn Any + Send + Sync), &mut DispatchContext) -> ListenerResult + Send + Sync,
 >;
-type AsyncFn = Box<
+type AsyncFn = Arc<
     dyn for<'a> Fn(&'a mut (dyn Any + Send + Sync), &'a mut DispatchContext) -> BoxFuture<'a, ListenerResult>
         + Send
         + Sync,
 >;
 
+#[derive(Clone)]
 enum ErasedCallable {
     Sync(SyncFn),
     Async(AsyncFn),
@@ -150,7 +151,7 @@ enum ErasedCallable {
 struct ListenerEntry {
     id: ListenerId,
     priority: i32,
-    callable: Arc<ErasedCallable>,
+    callable: ErasedCallable,
 }
 
 impl ListenerEntry {
@@ -162,13 +163,13 @@ impl ListenerEntry {
         Self {
             id: ListenerId(next_id()),
             priority,
-            callable: Arc::new(ErasedCallable::Sync(Box::new(move |any_event, ctx| {
+            callable: ErasedCallable::Sync(Arc::new(move |any_event, ctx| {
                 if let Some(event) = any_event.downcast_mut::<E>() {
                     func(event, ctx)
                 } else {
                     Ok(())
                 }
-            }))),
+            })),
         }
     }
 
@@ -183,13 +184,13 @@ impl ListenerEntry {
         Self {
             id: ListenerId(next_id()),
             priority,
-            callable: Arc::new(ErasedCallable::Async(Box::new(move |any_event, ctx| {
+            callable: ErasedCallable::Async(Arc::new(move |any_event, ctx| {
                 if let Some(event) = any_event.downcast_mut::<E>() {
                     func(event, ctx)
                 } else {
                     Box::pin(async { Ok(()) })
                 }
-            }))),
+            })),
         }
     }
 }
@@ -331,7 +332,7 @@ fn fetch_slow(inner: &StateInner, event_name: &str, type_id: TypeId) -> Option<A
 
 #[inline]
 fn all_sync(listeners: &[ListenerEntry]) -> bool {
-    listeners.iter().all(|e| matches!(&*e.callable, ErasedCallable::Sync(_)))
+    listeners.iter().all(|e| matches!(&e.callable, ErasedCallable::Sync(_)))
 }
 
 #[inline]
@@ -342,7 +343,7 @@ fn run_sync_loop<E: Event>(backend: Backend<'_>, max_depth: usize, event: &mut E
         if ctx.stopped {
             break;
         }
-        match &*entry.callable {
+        match &entry.callable {
             ErasedCallable::Sync(f) => f(event, &mut ctx)?,
             ErasedCallable::Async(_) => return Err(DispatchError::SyncDispatchUnavailable),
         }
@@ -356,7 +357,7 @@ async fn run_async_loop<E: Event>(backend: Backend<'_>, max_depth: usize, listen
         if ctx.stopped {
             break;
         }
-        match &*entry.callable {
+        match &entry.callable {
             ErasedCallable::Sync(f) => f(event, &mut ctx)?,
             ErasedCallable::Async(f) => f(event, &mut ctx).await?,
         }
@@ -732,12 +733,20 @@ impl ImmutableEventDispatcher {
 }
 
 pub trait EventSubscriber: Send + Sync + 'static {
-    fn register(&self, dispatcher: &EventDispatcher);
+    /// Registers the subscriber's listeners and returns their IDs, so the
+    /// whole subscription can later be removed as one unit.
+    fn register(&self, dispatcher: &EventDispatcher) -> Vec<ListenerId>;
 }
 
 impl EventDispatcher {
-    pub fn add_subscriber<S: EventSubscriber>(&self, subscriber: &S) {
-        subscriber.register(self);
+    pub fn add_subscriber<S: EventSubscriber>(&self, subscriber: &S) -> Vec<ListenerId> {
+        subscriber.register(self)
+    }
+
+    /// Removes several listeners at once (e.g. every ID returned by
+    /// `add_subscriber`); returns how many were actually present.
+    pub fn remove_listeners(&self, ids: &[ListenerId]) -> usize {
+        ids.iter().filter(|id| self.remove_listener(**id)).count()
     }
 }
 
