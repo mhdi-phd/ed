@@ -7,7 +7,7 @@ depth guard that cannot be bypassed.
 - **Sync + async listeners** in one dispatcher. A pure-sync fast path runs
   without any `Arc` refcounting on the hot path.
 - **`ListenerId`** (numeric, globally unique): `add_*` returns an ID,
-  `remove_listener(id)` / `remove_named_listener(event, id)` removes by ID.
+  `remove_listener(id)` removes by ID.
 - **Priorities**: higher runs first; equal priorities run in registration
   order (FIFO).
 - **Unified channel**: one name-keyed map. `Event::default_name()` (the type
@@ -37,7 +37,7 @@ Symfony-PHP `dispatch` ≈ 195ns (1 listener).
 ## Rules that matter
 
 - Listener identity is the numeric `ListenerId` (globally unique).
-  `remove_named_listener(event, id)` removes by ID.
+  `remove_listener(id)` removes by ID.
 - `with_max_depth(n)` bounds *nested* dispatch depth (default 128).
   A top-level `dispatch` always runs; nesting deeper than `n` returns
   `DispatchError::MaxDepthExceeded`.

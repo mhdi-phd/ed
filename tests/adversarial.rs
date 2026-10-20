@@ -142,7 +142,7 @@ fn attack_remove_during_dispatch_no_panic() {
         Ok(())
     });
     d.add_sync_listener::<Ev, _>(10, move |_, _| {
-        d2.remove_listener::<Ev>(victim);
+        d2.remove_listener(victim);
         Ok(())
     });
     let mut e = Ev::default();

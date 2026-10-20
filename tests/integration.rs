@@ -173,10 +173,10 @@ fn add_remove_has() {
     let b = d.add_sync_listener::<Ev, _>(0, |_, _| Ok(()));
     assert!(d.has_listeners::<Ev>());
     assert_eq!(d.listener_count::<Ev>(), 2);
-    assert!(d.remove_listener::<Ev>(a));
-    assert!(!d.remove_listener::<Ev>(a));
+    assert!(d.remove_listener(a));
+    assert!(!d.remove_listener(a));
     assert_eq!(d.listener_count::<Ev>(), 1);
-    assert!(d.remove_listener::<Ev>(b));
+    assert!(d.remove_listener(b));
     assert!(!d.has_listeners::<Ev>());
 }
 
@@ -392,7 +392,7 @@ fn frozen_dispatch_sync_works_and_rejects_async() {
 }
 
 #[test]
-fn remove_listener_by_id_only() {
+fn remove_listener_needs_only_id() {
     let d = new_disp();
     let a = d.add_sync_listener::<Ev, _>(0, |e, _| {
         e.log.push("a");
@@ -402,13 +402,13 @@ fn remove_listener_by_id_only() {
         e.log.push("b");
         Ok(())
     });
-    assert!(d.remove_listener_by_id(a));
-    assert!(!d.remove_listener_by_id(a));
+    assert!(d.remove_listener(a));
+    assert!(!d.remove_listener(a));
     assert_eq!(d.listener_count::<Ev>(), 0);
     let mut e = Ev::default();
     block_on(d.dispatch_named::<Ev>("named", &mut e)).unwrap();
     assert_eq!(e.log, vec!["b"]);
-    assert!(d.remove_listener_by_id(b));
+    assert!(d.remove_listener(b));
     let mut e2 = Ev::default();
     block_on(d.dispatch_named::<Ev>("named", &mut e2)).unwrap();
     assert!(e2.log.is_empty());
@@ -476,7 +476,7 @@ fn unicode_and_empty_names() {
     block_on(d.dispatch(&mut e)).unwrap();
     assert_eq!(e.log.len(), 2);
     let id = d.add_sync_listener::<Ev, _>(0, |_, _| Ok(()));
-    assert!(d.remove_listener::<Ev>(id));
+    assert!(d.remove_listener(id));
 }
 
 #[test]
@@ -525,7 +525,7 @@ fn dispatch_sync_nested_and_stopped() {
 }
 
 #[test]
-fn remove_wrong_type_keeps_listener() {
+fn remove_by_id_keeps_other_type_under_shared_name() {
     #[derive(Default)]
     struct Other2 {
         n: i32,
@@ -549,9 +549,16 @@ fn remove_wrong_type_keeps_listener() {
         e.n += 1;
         Ok(())
     });
-    assert!(!d.remove_named_listener::<Other2>("shared", id));
+    let id_other = d.add_sync_named_listener::<Other2, _>("shared", 0, |e: &mut Other2, _| {
+        e.n += 10;
+        Ok(())
+    });
+    assert!(d.remove_listener(id));
     let mut e = EvShared::default();
     block_on(d.dispatch_named::<EvShared>("shared", &mut e)).unwrap();
-    assert_eq!(e.n, 1);
-    assert!(d.remove_named_listener::<EvShared>("shared", id));
+    assert_eq!(e.n, 0);
+    let mut o = Other2::default();
+    block_on(d.dispatch_named::<Other2>("shared", &mut o)).unwrap();
+    assert_eq!(o.n, 10);
+    assert!(d.remove_listener(id_other));
 }
