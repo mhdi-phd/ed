@@ -50,6 +50,20 @@ impl Future for YieldOnce {
 }
 
 #[test]
+fn empty_dispatch_then_add_listener_still_fires() {
+    let d = EventDispatcher::new();
+    let mut e = Ev::default();
+    block_on(d.dispatch_named::<Ev>("late", &mut e)).unwrap();
+    block_on(d.dispatch_named::<Ev>("late", &mut e)).unwrap();
+    d.add_sync_named_listener::<Ev, _>("late", 0, |e: &mut Ev, _| {
+        e.log.push("fired");
+        Ok(())
+    });
+    block_on(d.dispatch_named::<Ev>("late", &mut e)).unwrap();
+    assert_eq!(e.log, vec!["fired"]);
+}
+
+#[test]
 fn panic_in_async_listener_restores_ambient_depth() {
     let d = EventDispatcher::new().with_max_depth(2);
     d.add_async_listener::<Ev, _>(0, |_: &mut Ev, _| {

@@ -284,7 +284,7 @@ fn fast_lookup(generation: u64, event_name: &str, version: u64) -> Option<Option
 fn fast_store(generation: u64, event_name: &str, version: u64, listeners: Option<Arc<[ListenerEntry]>>) {
     let all_sync = listeners
         .as_ref()
-        .is_some_and(|l| l.iter().all(|e| matches!(&*e.callable, ErasedCallable::Sync(_))));
+        .map_or(true, |l| l.iter().all(|e| matches!(&*e.callable, ErasedCallable::Sync(_))));
     FAST.with(|c| {
         let Ok(mut c) = c.try_borrow_mut() else {
             return;
@@ -300,7 +300,7 @@ fn fast_store(generation: u64, event_name: &str, version: u64, listeners: Option
             }
         }
         if c.len() >= FAST_CAP {
-            c.clear();
+            c.remove(0);
         }
         c.push(((generation, event_name.into()), FastEntry { version, listeners, all_sync }));
     })
@@ -562,7 +562,10 @@ impl EventDispatcher {
                     if !e.all_sync {
                         return None;
                     }
-                    let listeners: &[ListenerEntry] = e.listeners.as_deref()?;
+                    let listeners: &[ListenerEntry] = match &e.listeners {
+                        Some(l) => l,
+                        None => return Some(Ok(())),
+                    };
                     return Some(Self::run_sync_loop(backend, max_depth, event, listeners, depth));
                 }
             }
